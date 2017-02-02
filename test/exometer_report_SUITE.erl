@@ -24,6 +24,7 @@
     test_subscribe/1,
     test_subscribe_find/1,
     test_subscribe_select/1,
+    test_subscription_race_regression/1,
     test_logger_flow_control/1,
     test_logger_flow_control_2/1
    ]).
@@ -52,7 +53,8 @@ groups() ->
        test_newentry,
        test_subscribe,
        test_subscribe_find,
-       test_subscribe_select
+       test_subscribe_select,
+       test_subscription_race_regression
       ]},
      {test_logger, [],
       [
@@ -184,6 +186,39 @@ start_logger_and_reporter(Reporter, Config) ->
             {port, Port},
             {intervals, [{main, manual}]}]),
     {ok, Info}.
+
+
+test_subscription_race_regression(Config) ->
+    {ok, Info} = start_logger_and_reporter(brittle_reporter, Config),
+    ok = exometer:new([c,1], counter, []),
+    exometer_report:subscribe(brittle_reporter, {find,[c,'_']}, value, main, true),
+    LoggerPid = whereis(brittle_reporter),
+
+    %% Build the right message queue: First some spam, then a 'subscribe' request, then a monitor 'DOWN' message:
+    %% - Spam queue to 'exometer_report' process:
+    lists:foreach(fun(_) -> exometer_report:trigger_interval(brittle_reporter, main)
+                  end, lists:seq(1,100)),
+    %% - Then enqueue message for sensitive code path:
+    Me = self(),
+    proc_lib:spawn_link(fun() ->
+                                Res = exometer_report:subscribe(brittle_reporter, {find,[c,'_']}, value, main, true),
+                                Me ! {subscribe_result, Res}
+                        end),
+
+    %% - Then, while it is busy, kill the 'exometer_report_logger' process:
+    erlang:exit(LoggerPid, whoops),
+
+    %% Now the race condition is set up.
+    %% Wait for triggering message to be processed, see if things get out of whack:
+    %% (The usual result of this is that exometer_report crashes.)
+    receive
+        {subscribe_result, Result} ->
+            io:format(user, "Result=~p\n", [Result])
+    after 2000 ->
+            io:format(user, "Messages at timeout: ~p\n", [erlang:process_info(self(), messages)]),
+            error(subscribe_timeout)
+    end.
+
 
 ensure_reuse(Opts) ->
     case lists:keyfind(reuseaddr, 1, Opts) of
